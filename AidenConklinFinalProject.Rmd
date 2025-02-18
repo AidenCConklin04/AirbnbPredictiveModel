@@ -1,0 +1,354 @@
+---
+title: "Aiden Conklin Final Project"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(tidymodels)
+library(rpart)
+library(rpart.plot)
+library(vip)
+library(corrplot)
+library(bonsai)
+
+
+austin_listings <- read.csv("austin_listings.csv")
+head(austin_listings)
+
+listings_data_dictionary <- read.csv("listings_data_dictionary.csv")
+head(listings_data_dictionary)
+
+holdout_x <- read.csv("holdout_x.csv")
+head(holdout_x)
+
+```
+
+```{r}
+#Cleanse Data before clustering
+
+austin_listings_factors <- austin_listings %>%
+  select(-longitude, -id, -listing_url, -name, -picture_url, -host_id, -host_url,-host_since, -host_name,-zip_code ) %>%
+  mutate(description = nchar(as.character(description))) %>% 
+  rename(desc_length = description) %>% 
+  mutate(across(where(is.character), ~ as.numeric(as.factor(.))))
+
+airbnb_recipe <- recipe(austin_listings_factors) |>
+  step_impute_median(all_numeric()) %>% 
+  step_log(all_numeric(), base = 10, offset = 0.001) |> 
+  step_center(all_numeric()) |> 
+  step_scale(all_numeric())
+
+airbnb_scaled <- airbnb_recipe |>
+  prep() %>% 
+  bake(austin_listings_factors)
+
+hist(austin_listings$price)
+hist(airbnb_scaled$price)
+
+```
+
+```{r}
+#Elbow Plot
+for (i in 1:ncol(airbnb_scaled)) {
+  column <- airbnb_scaled[[i]]
+  
+  if (is.numeric(column) || is.logical(column)) {
+    avg <- round(mean(column, na.rm = TRUE), 10)
+    std <- round(sd(column, na.rm = TRUE), 10)
+
+    col_name <- names(airbnb_scaled)[i]
+    cat("*", col_name, "-", "Average:", avg, "SD:", std, "\n")
+  }
+}
+
+ss <- c()
+
+
+for (k in 1:20) {
+  clst <- kmeans(
+    x = airbnb_scaled,
+    centers = k,
+    nstart=25,
+    iter.max = 30
+  )
+ ss[k] <- clst$tot.withinss
+}
+
+plot(ss)
+```
+
+```{r}
+#Final Clustering
+#K = 6
+k <- 6
+clst <- kmeans(
+  airbnb_scaled,
+  centers = k,
+  nstart = 10,
+  iter.max = 10
+)
+
+clst$centers
+table(clst$cluster)
+plot_centroids_table(clst)
+
+austin_listings <- austin_listings |> 
+  mutate(kmeans6 = clst$cluster)
+
+austin_listings |> 
+  group_by(kmeans6) |> 
+  summarise(across(where(is.numeric), mean, na.rm = TRUE))
+
+austin_listings |> 
+  group_by(kmeans6) |> 
+  summarise(across(where(is.numeric), median, na.rm = TRUE))
+
+d <- dist(airbnb_scaled)
+clst <- hclust(d, method = "ward.D2")
+plot(clst)
+austin_listings <- austin_listings |> 
+  mutate(hclust6 = cutree(clst, k = 6))
+
+table(austin_listings$kmeans6)
+table(austin_listings$hclust6)
+
+austin_listings$clusterGroup <- austin_listings$kmeans6
+austin_listings <- austin_listings %>% 
+  select(-kmeans6)
+
+austin_listings %>%
+  group_by(clusterGroup) %>%
+  select(clusterGroup, accommodates, bathrooms, bedrooms, beds, price) %>% 
+  summarise(across(where(is.numeric), median, na.rm = TRUE))
+
+austin_listings %>%
+  group_by(hclust6) %>%
+  select(hclust6, accommodates, bathrooms, bedrooms, beds, price) %>% 
+  summarise(across(where(is.numeric), median, na.rm = TRUE))
+
+```
+
+```{r}
+#Model 1 Decision Tree
+
+austin_splits <- initial_split(austin_listings, prop = 0.8, strata = price)
+
+austin_train <- training(austin_splits)
+austin_test <- testing(austin_splits)
+
+austin_recipe <- recipe(price ~ ., data = austin_train) |>
+  step_mutate(host_since = as.Date(host_since)) %>%  # Convert to Date
+  step_mutate(host_since = year(host_since)) %>%  
+  step_mutate(desc_length = nchar(as.character(description))) %>% 
+  step_rm(description, id, listing_url, name, picture_url, host_id, host_url, host_name, latitude, longitude) %>% 
+  step_normalize(all_numeric_predictors()) |>
+  step_corr(all_numeric_predictors()) |>
+  step_nzv(all_predictors())
+
+austin_recipe %>% 
+  prep()
+
+austin_cv_tree <- decision_tree(
+  mode = "regression",
+  cost_complexity = tune(),
+  min_n = tune(),
+  tree_depth = 10
+)
+
+austin_cv_workflow <- workflow() %>%
+  add_recipe(austin_recipe) %>%
+  add_model(austin_cv_tree)
+
+austin_tree_grid <- grid_regular(
+  cost_complexity(),
+  min_n(),
+  levels = 5
+)
+
+austin_folds <- vfold_cv(austin_train, v = 5, strata = price)
+
+austin_tune_results <- tune_grid(
+  austin_cv_workflow,
+  resamples = austin_folds,
+  grid = austin_tree_grid
+)
+
+best_params <- select_by_one_std_err(austin_tune_results, desc(cost_complexity))
+
+austin_final_workflow <- finalize_workflow(austin_cv_workflow, best_params)
+
+austin_fit_workflow <- austin_final_workflow %>%
+  fit(data = austin_train)
+
+austin_fit_workflow %>%
+  extract_fit_engine() %>%
+  rpart.plot(roundint = FALSE)
+
+```
+
+```{r}
+#Decision Tree Metrics
+austin_cv_train_preds <- austin_fit_workflow %>%
+  predict(new_data = austin_listings) %>% 
+  bind_cols(austin_listings)
+
+austin_cv_train_preds %>%
+  metrics(truth = price, estimate = .pred)
+```
+
+```{r}
+#KNN Model
+set.seed(123) 
+knn_split <- initial_split(austin_listings, prop = 0.8)
+knn_train <- training(knn_split)
+knn_test <- testing(knn_split)
+
+
+knn_recipe <- recipe(price ~., data = knn_train) %>%
+  step_rm(description, id, listing_url, name, picture_url, host_id, host_url, host_name, host_since) %>% 
+  step_impute_median(all_numeric_predictors()) %>% 
+  step_impute_mode(all_nominal()) %>% 
+  step_interact(~ latitude:longitude) %>% 
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_corr(all_numeric_predictors()) %>% 
+  step_nzv(all_numeric_predictors())
+  
+
+prep(knn_recipe)
+
+knn_austin <- nearest_neighbor(
+  mode = "regression",
+  neighbors = tune()
+)
+
+knn_folds <- vfold_cv(knn_train, v = 5, strata = price)
+
+knn_wf <- workflow() %>%
+  add_recipe(knn_recipe) %>%
+  add_model(knn_austin)
+
+knn_grid <- grid_regular(neighbors(), levels = 10)  
+
+knn_tune_results <- tune_grid(
+  knn_wf,
+  resamples = knn_folds,  
+  grid = knn_grid
+)
+
+best_knn_params <- select_best(knn_tune_results, metric = "rmse")
+
+final_knn_wf <- finalize_workflow(knn_wf, best_knn_params)
+
+knn_wf_fit <- final_knn_wf %>%
+  fit(knn_train)
+
+preds <- predict(knn_wf_fit, knn_train)
+nrow(preds)
+
+train_knn_preds <- bind_cols(
+  predict(knn_wf_fit, knn_train),
+  knn_train
+)
+```
+
+```{r}
+#Metrics
+knn_preds <- knn_wf_fit %>%
+  predict(new_data = austin_listings) %>% 
+  bind_cols(austin_listings)
+
+
+knn_preds |> 
+  metrics(truth = price, estimate = .pred)
+
+```
+
+
+```{r}
+#Random Forest Model
+rf_recipe <- recipe(price ~ ., data = boosted_train) |>
+  step_mutate(host_since = as.Date(host_since)) %>%  # Convert to Date
+  step_mutate(host_since = year(host_since)) %>%  
+  step_mutate(desc_length = nchar(as.character(description))) %>% 
+  step_rm(description, id, listing_url, name, picture_url, host_id, host_url, host_name) %>% 
+  step_impute_median(all_numeric_predictors()) %>% 
+  step_impute_mode(all_nominal()) %>%
+  step_log(number_of_reviews, beds, base = 10, offset = .001) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_corr(all_numeric_predictors()) |>
+  step_lincomb(all_numeric_predictors()) |>
+  step_nzv(all_numeric_predictors())
+
+rf <- rand_forest(
+  mode = "regression",
+  mtry = tune(),
+  min_n = tune(),
+  trees = 500
+) |> 
+  set_engine("ranger", importance = "impurity")
+
+wf_rf_cv <- workflow() |> 
+  add_recipe(rf_recipe) |> 
+  add_model(rf)
+
+
+rf_grid <- grid_regular(
+  mtry(range = c(2, 6)),
+  min_n(range = c(2,10)),
+  levels = 5
+)
+
+rf_folds <- vfold_cv(boosted_train, v = 5)
+
+rf_cv_results <- tune_grid(
+  wf_rf_cv,
+  resamples = rf_folds,
+  grid = rf_grid
+)
+
+
+(rf_params <- select_best(rf_cv_results))
+wf_rf <- finalize_workflow(wf_rf_cv, rf_params)
+
+wf_rf_fit <- wf_rf |> 
+  fit(boosted_train)
+```
+
+```{r}
+#Metrics/What effected the model
+wf_rf_fit |> 
+  predict(boosted_train) |> 
+  bind_cols(boosted_train) |> 
+  metrics(truth = price, estimate = .pred)
+
+wf_rf_fit |> 
+  predict(boosted_train, type = "numeric") |> 
+  bind_cols(boosted_train) |> 
+  arrange(desc(.pred)) %>% 
+  select(.pred, accommodates, beds, bedrooms, bathrooms)
+
+vip(wf_rf_fit)
+
+plot(austin_listings$price ~ austin_listings$number_of_reviews)
+plot(austin_listings$price ~ log10(austin_listings$host_total_listings_count))
+```
+
+```{r}
+#Kaggle Submission
+holdout_rf_preds <- wf_rf_fit %>%
+  predict(new_data = holdout_x) %>% 
+  bind_cols(holdout_x)
+
+holdout_rf_preds$price <- holdout_rf_preds$.pred
+
+holdout_rf_predictions <- holdout_rf_preds %>% 
+  select(id, price)
+
+write.csv(holdout_rf_predictions, "/Users/aiden/OneDrive/Desktop/BAS320 & 474/BAS474FinalProject/holdout_predictions.csv", row.names = FALSE)
+
+```
